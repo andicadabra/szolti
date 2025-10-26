@@ -83,7 +83,7 @@ class SailRecommendation:
         raise ValueError("sex must be 'male' or 'female'")
 
 st.set_page_config(page_title="Windsurf Sail Size Recommender", layout="centered")
-st.title("🏄‍♂️ Windsurf Sail Size Recommender")
+st.title("🏄‍♂️ Windsurf Sail Size Recommender by Andreas Rössler")
 st.caption("Estimate sail size from wind (kn), rider weight (kg), and skill factor.")
 
 with st.sidebar:
