@@ -1,6 +1,8 @@
 import streamlit as st
 import math
-from typing import Optional
+from typing import Optional, Tuple
+import numpy as np
+import matplotlib.pyplot as plt
 
 class SailRecommendation:
     def __init__(self):
@@ -14,6 +16,7 @@ class SailRecommendation:
 
         # Gentle context multipliers
         self.discipline_map = {
+            "general": 1.00,  # NEW neutral default
             "freestyle": 0.95,
             "freeride": 1.05,
             "wave": 0.95,
@@ -35,7 +38,7 @@ class SailRecommendation:
         return 1.225 * (pressure_hPa / 1013.25) * (273.15 / T)
 
     def _context_factor(self,
-                        discipline: str = "freestyle",
+                        discipline: str = "general",
                         sea_state: str = "flat",
                         rig_eff: float = 1.00,
                         skill_factor: float = 1.00) -> float:
@@ -48,7 +51,7 @@ class SailRecommendation:
                    gust_kn: Optional[float] = None,
                    temp_C: float = 15.0,
                    pressure_hPa: float = 1013.25,
-                   discipline: str = "freestyle",
+                   discipline: str = "general",  # <— was "freestyle"
                    sea_state: str = "flat",
                    rig_eff: float = 1.00,
                    skill_factor: float = 1.00,
@@ -58,14 +61,70 @@ class SailRecommendation:
         Veff = self._eff_wind(wind_kn, gust_kn=gust_kn)
         rho = self._air_density(temp_C=temp_C, pressure_hPa=pressure_hPa)
         Fctx = self._context_factor(discipline, sea_state, rig_eff, skill_factor)
-        # A = K * (W/Wref)^p * (Vref/Veff)^q * (rho0/rho) * Fctx
-        return (
-            base_K
-            * (max(1e-6, weight_kg) / ref_weight) ** self.p
-            * (self.Vref / max(0.1, Veff)) ** self.q
-            * (self.rho0 / rho)
-            * Fctx
+
+        raw = (
+                base_K
+                * (max(1e-6, weight_kg) / ref_weight) ** self.p
+                * (self.Vref / max(0.1, Veff)) ** self.q
+                * (self.rho0 / rho)
+                * Fctx
         )
+        return self._apply_caps(raw, discipline, wind_kn, weight_kg=weight_kg, sea_state=sea_state)  # clamp here
+
+    def caps(self, discipline: str, wind_kn: float, weight_kg: float = 75.0, sea_state: str = "flat") -> Tuple[
+        float, float]:
+        d = (discipline or "general").lower()
+        s = (sea_state or "flat").lower()
+
+        # Base global adult window
+        amin, amax = 3.2, 8.5
+
+        # Discipline windows
+        if d == "freestyle":
+            amin, amax = max(amin, 3.6), min(amax, 5.2)
+        elif d == "wave":
+            amin, amax = max(amin, 3.4), min(amax, 5.3)
+        elif d == "freeride":
+            amin, amax = max(amin, 4.0), min(amax, 7.5)
+        elif d == "slalom":
+            amin, amax = max(amin, 4.6), min(amax, 9.0)
+
+        # Wind-aware floors/ceilings
+        if wind_kn <= 12.0:
+            # Very light wind minimums
+            if d in ("general", "wave"):
+                amin = max(amin, 5.0 if d == "general" else 4.2)
+            if d == "freeride":
+                amin = max(amin, 5.6)
+            if d == "slalom":
+                amin = max(amin, 6.3)
+        if wind_kn >= 30.0:
+            # High-wind floors
+            amin = max(amin, 3.7)
+            # Optional high-wind ceilings
+            if d in ("general", "wave", "freestyle"):
+                amax = min(amax, 5.0)
+            elif d == "freeride":
+                amax = min(amax, 5.5)
+            elif d == "slalom":
+                amax = min(amax, 5.8)
+
+        # Weight-based max tweak (±0.6 m² clamp)
+        dW = float(weight_kg) - 75.0
+        delta_max = max(-0.6, min(0.6, 0.4 * (dW / 20.0)))
+        amax = min(8.5 if d != "slalom" else 9.0, max(amin, amax + delta_max))
+
+        # Sea-state tiny nudge
+        if s == "waves":
+            amax = max(amin, amax - 0.2)
+        elif s == "chop":
+            amin = min(amax, amin + 0.1)
+
+        return (amin, amax)
+
+    def _apply_caps(self, area: float, discipline: str, wind_kn: float, weight_kg: float = 75.0, sea_state: str = "flat") -> float:
+        amin, amax = self.caps(discipline, wind_kn, weight_kg=weight_kg, sea_state=sea_state)
+        return max(amin, min(area, amax))
 
     # ---------- public API (backward-compatible) ----------
     def get_sail_recommendation_for_men(self, weight: float, wind: float, skill: float, **kwargs) -> float:
@@ -81,6 +140,7 @@ class SailRecommendation:
         if s == "female":
             return self.get_sail_recommendation_for_women(weight, wind, skill, **kwargs)
         raise ValueError("sex must be 'male' or 'female'")
+
 
 st.set_page_config(page_title="Windsurf Sail Size Recommender", layout="centered")
 st.title("🏄‍♂️ Windsurf Sail Size Recommender by Andreas Rössler")
@@ -158,12 +218,60 @@ if st.button("Calculate", type="primary", key="calc_main"):
             f"For a **{sex.lower()}** rider at **{weight:.0f} kg** and **{wind:.0f} kn** "
             f"with skill **{skill:.1f}**, the estimate is **~{rounded} m²**."
         )
-        # Nearby sizes
+        # Determine active discipline for caps (only if the context toggle is on)
+        active_disc = discipline if ('use_context' in locals() and use_context and 'discipline' in locals()) else "general"
+        amin, amax = model.caps(active_disc, wind, weight_kg=weight, sea_state=sea_state if ('use_context' in locals() and use_context and 'sea_state' in locals()) else "flat")
+
+        # Nearby sizes clamped to caps
         cands = sorted({
-            max(2.5, round(rounded - 0.5, 1)),
-            round(rounded, 1),
-            min(8.5, round(rounded + 0.5, 1)),
+            max(amin, round(rounded - 0.5, 1)),
+            max(amin, min(amax, round(rounded, 1))),
+            min(amax, round(rounded + 0.5, 1)),
         })
         st.write("Nearby sizes you might also consider: " + ", ".join(f"{c} m²" for c in cands))
 
+        # Note if a cap was applied
+        if abs(rounded - amin) < 1e-9:
+            st.info(f"Note: capped at {amin:.1f} m² for {active_disc} / {wind:.0f} kn.")
+        elif abs(rounded - amax) < 1e-9:
+            st.info(f"Note: capped at {amax:.1f} m² for {active_disc}.")
+
+
 st.markdown("---\n⚠️ Always consider board/fin, gustiness, and preference.")
+
+def plot_sail_size_vs_factors():
+    model = SailRecommendation()
+
+    # Define ranges
+    wind_values = np.linspace(10, 30, 50)   # knots
+    weight_values = np.linspace(50, 100, 50) # kg
+    skill_levels = [0.9, 1.0, 1.1]
+    sexes = ["male", "female"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # --- Plot vs Wind ---
+    for sex in sexes:
+        for skill in skill_levels:
+            y = [model.recommend(sex, 75, w, skill) for w in wind_values]
+            axes[0].plot(wind_values, y, label=f"{sex}-{skill}")
+    axes[0].set_title("Sail size vs Wind (weight=75 kg)")
+    axes[0].set_xlabel("Wind [knots]")
+    axes[0].set_ylabel("Sail size [m²]")
+    axes[0].legend()
+
+    # --- Plot vs Weight ---
+    for sex in sexes:
+        for skill in skill_levels:
+            y = [model.recommend(sex, w, 20, skill) for w in weight_values]
+            axes[1].plot(weight_values, y, label=f"{sex}-{skill}")
+    axes[1].set_title("Sail size vs Weight (wind=20 kn)")
+    axes[1].set_xlabel("Weight [kg]")
+    axes[1].set_ylabel("Sail size [m²]")
+    axes[1].legend()
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+if st.button("Plot Sail Size Curves"):
+        plot_sail_size_vs_factors()
